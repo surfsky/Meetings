@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 import { UploadFilled } from '@element-plus/icons-vue'
 import ExcelJS from 'exceljs'
 import dayjs from 'dayjs'
@@ -34,7 +34,127 @@ interface ReportRow {
 
 const tableData = ref<ReportRow[]>([])
 const departments = ref<string[]>([])
-// const loading = ref(false)
+const allRecords = ref<MeetingRecord[]>([])
+const deptOrderMap = ref<Map<string, number>>(new Map())
+
+const searchDateRange = ref<[string, string] | null>(null)
+const searchCategories = ref<string[]>([])
+
+const availableTypes = computed(() => {
+    const types = new Set<string>()
+    allRecords.value.forEach(r => {
+        if (r.type) types.add(r.type)
+    })
+    return Array.from(types)
+})
+
+const handleSearch = () => {
+    if (allRecords.value.length === 0) return
+
+    let filtered = allRecords.value
+
+    // Filter by Date Range
+    if (searchDateRange.value && searchDateRange.value.length === 2) {
+        const [start, end] = searchDateRange.value
+        // String comparison works for YYYY-MM-DD
+        filtered = filtered.filter(r => {
+            return r.date >= start && r.date <= end
+        })
+    }
+
+    // Filter by Category
+    if (searchCategories.value.length > 0) {
+        filtered = filtered.filter(r => searchCategories.value.includes(r.type))
+    }
+
+    generateTableData(filtered)
+}
+
+const generateTableData = (records: MeetingRecord[]) => {
+  const deptSet = new Set<string>()
+  records.forEach(r => deptSet.add(r.department))
+
+  departments.value = Array.from(deptSet).sort((a, b) => {
+      if (deptOrderMap.value.size > 0) {
+          const orderA = deptOrderMap.value.get(a) ?? 999
+          const orderB = deptOrderMap.value.get(b) ?? 999
+          if (orderA !== orderB) {
+              return orderA - orderB
+          }
+      }
+      return a.localeCompare(b)
+  })
+  
+  // Group by Month + Week
+  const grouped = new Map<string, ReportRow>()
+
+  // Determine year range from records
+  const years = new Set<number>()
+  records.forEach(r => {
+      years.add(dayjs(r.date).year())
+  })
+  
+  // Default to current year if no data
+  if (years.size === 0) {
+      years.add(dayjs().year())
+  }
+
+  // Initialize all weeks 1-53 for each year
+  years.forEach(year => {
+      for (let w = 1; w <= 53; w++) {
+          const d = dayjs().year(year).isoWeek(w).day(4)
+          const key = `${year}-${w}`
+          grouped.set(key, {
+              month: d.format('YYYYMM'),
+              week: w,
+          })
+      }
+  })
+
+  // Merge actual records
+   records.forEach(r => {
+     const d = dayjs(r.date)
+     const year = d.year()
+     
+     const lookupKey = `${year}-${r.week}`
+    
+    if (!grouped.has(lookupKey)) {
+        grouped.set(lookupKey, {
+            month: r.month,
+            week: r.week
+        })
+    }
+    
+    const row = grouped.get(lookupKey)!
+     row[r.department] = {
+       date: r.date,
+       content: r.content,
+       photo: r.photo,
+       type: r.type,
+       department: r.department,
+       month: r.month,
+       week: r.week
+     }
+   })
+   
+   // Sort by key (Year-Week)
+   tableData.value = Array.from(grouped.entries())
+       .sort((a, b) => {
+           const partsA = a[0].split('-')
+           const partsB = b[0].split('-')
+           const y1 = Number(partsA[0])
+           const w1 = Number(partsA[1])
+           const y2 = Number(partsB[0])
+           const w2 = Number(partsB[1])
+           
+           if (y1 !== y2) return y1 - y2
+           return w1 - w2
+       })
+       .map(e => e[1])
+
+  console.log('Processed rows:', tableData.value.length)
+}
+
 
 const handleFileUpload = async (file: any) => {
   const rawFile = file.raw
@@ -117,8 +237,7 @@ const handleFileUpload = async (file: any) => {
     }
 
     const records: MeetingRecord[] = []
-    const deptSet = new Set<string>()
-
+    
     // Images handling
     const images: { [key: string]: string } = {}
     const worksheetImages = worksheet.getImages()
@@ -248,8 +367,6 @@ const handleFileUpload = async (file: any) => {
       }
 
       if (dateStr && department) {
-        deptSet.add(department)
-        
         // Calculate Month and Week
         // Assuming dateStr is YYYY-MM-DD
         const d = dayjs(dateStr)
@@ -280,10 +397,12 @@ const handleFileUpload = async (file: any) => {
       }
     })
 
+    allRecords.value = records
+
     // Grouping
     // Check if "排序" sheet exists for custom sorting
     const sortSheet = workbook.getWorksheet('排序')
-    const deptOrder = new Map<string, number>()
+    deptOrderMap.value.clear()
     
     if (sortSheet) {
         sortSheet.eachRow((row, rowNumber) => {
@@ -291,100 +410,12 @@ const handleFileUpload = async (file: any) => {
             const order = row.getCell(1).value
             const name = row.getCell(2).text
             if (name && typeof order === 'number') {
-                deptOrder.set(name.trim(), order)
+                deptOrderMap.value.set(name.trim(), order)
             }
         })
     }
 
-    departments.value = Array.from(deptSet).sort((a, b) => {
-        if (deptOrder.size > 0) {
-            const orderA = deptOrder.get(a) ?? 999
-            const orderB = deptOrder.get(b) ?? 999
-            if (orderA !== orderB) {
-                return orderA - orderB
-            }
-        }
-        return a.localeCompare(b)
-    })
-    
-    // Group by Month + Week
-    const grouped = new Map<string, ReportRow>()
-
-    // Determine year range from records
-    const years = new Set<number>()
-    records.forEach(r => {
-        years.add(dayjs(r.date).year())
-    })
-    
-    // Default to current year if no data
-    if (years.size === 0) {
-        years.add(dayjs().year())
-    }
-
-    // Initialize all weeks 1-53 for each year
-    years.forEach(year => {
-        for (let w = 1; w <= 53; w++) {
-            // Determine representative month for the week (using Thursday)
-            const d = dayjs().year(year).isoWeek(w).day(4)
-            // If week 53 falls into next year significantly or is invalid, dayjs handles it.
-            // But we want strict 1-53 rows.
-            // Check if this week actually belongs to this year in ISO terms?
-            // Actually, just generating 1-53 is safer to ensure continuity.
-            
-            const key = `${year}-${w}`
-            grouped.set(key, {
-                month: d.format('YYYYMM'),
-                week: w,
-                // departments will be filled later
-            })
-        }
-    })
-
-    // Merge actual records
-     records.forEach(r => {
-       const d = dayjs(r.date)
-       const year = d.year()
-       
-       const lookupKey = `${year}-${r.week}`
-      
-      if (!grouped.has(lookupKey)) {
-          // Should exist if we initialized 1-53. 
-          // If not (maybe year mismatch), create it.
-          grouped.set(lookupKey, {
-              month: r.month,
-              week: r.week
-          })
-      }
-      
-      const row = grouped.get(lookupKey)!
-       row[r.department] = {
-         date: r.date,
-         content: r.content,
-         photo: r.photo,
-         type: r.type,
-         department: r.department,
-         month: r.month,
-         week: r.week
-       }
-     })
-     
-     // tableData.value = Array.from(grouped.values())
-     // Sort by key (Year-Week)
-     tableData.value = Array.from(grouped.entries())
-         .sort((a, b) => {
-             const partsA = a[0].split('-')
-             const partsB = b[0].split('-')
-             const y1 = Number(partsA[0])
-             const w1 = Number(partsA[1])
-             const y2 = Number(partsB[0])
-             const w2 = Number(partsB[1])
-             
-             if (y1 !== y2) return y1 - y2
-             return w1 - w2
-         })
-         .map(e => e[1])
-
-    console.log('Processed rows:', tableData.value.length)
+    generateTableData(allRecords.value)
   } catch (error) {
     console.error(error)
     ElMessage.error('解析文件失败: ' + (error as Error).message)
@@ -556,16 +587,19 @@ const downloadWord = async () => {
                     }
 
                     // Content text (Date + Content combined)
+                    // Format: 2025-01-01 周会： 会议内容
+                    const headerText = ' ' + record.date + (record.type ? ' ' + record.type : '') + '：';
+                    
                     paragraphChildren.push(
                         new TextRun({
-                            text: ' ' + record.date,
+                            text: headerText,
                             bold: true,
                             size: 20, // 10pt
                         })
                     );
                     paragraphChildren.push(
                         new TextRun({
-                            text: "  " + record.content, // Space + Content
+                            text: " " + record.content, // Space + Content
                             size: 20, // 10pt
                         })
                     );
@@ -649,29 +683,72 @@ const downloadWord = async () => {
 
 <template>
   <div class="report-container">
-    <h1>会议历汇总工具</h1>
-    <div class="toolbar">
-      <el-upload
-        class="upload-demo"
-        drag
-        action="#"
-        :auto-upload="false"
-        :on-change="handleFileUpload"
-        :show-file-list="false"
-        accept=".xlsx, .xls"
-      >
-        <el-icon class="el-icon--upload"><upload-filled /></el-icon>
-        <div class="el-upload__text">
-          拖拽 Excel 文件到此处或 <em>点击上传</em>
+    <h1>会议历</h1>
+    <div class="toolbar-container">
+      <div class="top-toolbar" v-if="allRecords.length === 0">
+        <el-upload
+          class="upload-demo"
+          drag
+          action="#"
+          :auto-upload="false"
+          :on-change="handleFileUpload"
+          :show-file-list="false"
+          accept=".xlsx, .xls"
+        >
+          <el-icon class="el-icon--upload"><upload-filled /></el-icon>
+          <div class="el-upload__text">
+            拖拽 Excel 文件到此处或点击上传
+          </div>
+          <div class="example-link" @click.stop>
+              <a href="./example.xlsx" download="会议记录模版.xlsx">示例下载</a>
+          </div>
+        </el-upload>
+      </div>
+
+      <div class="search-toolbar" v-if="allRecords.length > 0">
+        <div class="search-item">
+            <span class="label">时间范围：</span>
+            <el-date-picker
+                v-model="searchDateRange"
+                type="daterange"
+                range-separator="-"
+                start-placeholder="开始日期"
+                end-placeholder="结束日期"
+                value-format="YYYY-MM-DD"
+            />
         </div>
-        <div class="example-link" @click.stop>
-            <a href="/example.xlsx" download="会议记录模版.xlsx">示例下载</a>
+        <div class="search-item">
+            <span class="label">类别：</span>
+            <el-select
+                v-model="searchCategories"
+                multiple
+                placeholder="请选择类别"
+                style="width: 240px"
+            >
+                <el-option
+                    v-for="item in availableTypes"
+                    :key="item"
+                    :label="item"
+                    :value="item"
+                />
+            </el-select>
         </div>
-      </el-upload>
-      
-      <div v-if="tableData.length" class="actions">
-        <el-button type="success" @click="downloadWord">下载 Word</el-button>
-        <el-button type="primary" @click="downloadPDF">下载 PDF</el-button>
+        <el-button type="primary"  @click="handleSearch">查询</el-button>
+        
+
+        <div v-if="tableData.length" class="actions">
+          <el-button type="success" @click="downloadWord">下载 Word</el-button>
+          <el-button type="success" @click="downloadPDF">下载 PDF</el-button>
+        </div>
+        <el-upload
+          action="#"
+          :auto-upload="false"
+          :on-change="handleFileUpload"
+          :show-file-list="false"
+          accept=".xlsx, .xls"
+        >
+           <el-button type="warning">重新上传</el-button>
+        </el-upload>
       </div>
     </div>
     
@@ -696,6 +773,9 @@ const downloadWord = async () => {
         >
           <template #default="{ row }">
             <div v-if="row[dept]" class="cell-content">
+              <div v-if="row[dept].type" class="meeting-type-tag">
+                  {{ row[dept].type }}
+              </div>
               <div v-if="row[dept].photo" class="photo">
                 <el-image 
                     :src="row[dept].photo" 
@@ -726,12 +806,47 @@ h1 {
   color: #333;
 }
 
-.toolbar {
+.toolbar-container {
   margin-bottom: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  align-items: flex-start;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  background-color: #fff;
+  padding: 10px 0;
+}
+
+.top-toolbar {
   display: flex;
   gap: 20px;
   align-items: flex-start;
   justify-content: center;
+  width: 100%;
+}
+
+.search-toolbar {
+    display: flex;
+    gap: 20px;
+    align-items: center;
+    padding: 10px;
+    background-color: #f5f7fa;
+    border-radius: 4px;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.search-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.search-item .label {
+    font-weight: bold;
+    color: #000000;
 }
 
 .upload-demo {
@@ -754,17 +869,26 @@ h1 {
 
 .actions {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   gap: 10px;
 }
 
 .actions .el-button {
   margin-left: 0;
-  width: 100%;
+  width: auto;
 }
 
 .custom-table {
   border: 1px solid #333;
+  overflow: visible !important;
+}
+
+:deep(.el-table__header-wrapper) {
+  position: sticky;
+  top: 72px;
+  z-index: 99;
+  background-color: #fff;
+  border-top: 1px solid #333;
 }
 
 :deep(.el-table__inner-wrapper::before) {
@@ -786,6 +910,21 @@ h1 {
   flex-direction: column;
   gap: 8px;
   padding: 8px;
+  position: relative;
+}
+
+.meeting-type-tag {
+    position: absolute;
+    top: 5px;
+    right: 5px;
+    border: 1px solid #e54d42;
+    color: #e54d42;
+    border-radius: 12px;
+    padding: 2px 8px;
+    font-size: 12px;
+    background: rgba(255, 255, 255, 0.9);
+    z-index: 10;
+    font-weight: bold;
 }
 
 .photo :deep(.el-image) {
