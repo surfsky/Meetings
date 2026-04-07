@@ -10,6 +10,7 @@ import jsPDF from 'jspdf'
 import JSZip from 'jszip'
 import { Document, Packer, Paragraph, Table, TableCell, TableRow, WidthType, ImageRun, TextRun, VerticalAlign, PageOrientation, AlignmentType, LineRuleType, HeightRule, Footer, PageNumber, TextWrappingType, TextWrappingSide } from 'docx'
 import { saveAs } from 'file-saver'
+import { exportReportToExcel, type ExcelExportRow } from '../utils/reportExcelExport'
 
 dayjs.extend(weekOfYear)
 dayjs.extend(isoWeek)
@@ -39,6 +40,25 @@ const deptOrderMap = ref<Map<string, number>>(new Map())
 
 const searchDateRange = ref<[string, string] | null>(null)
 const searchCategories = ref<string[]>([])
+const weekNumberMode = ref<'yearly' | 'monthly'>('yearly')
+const showMeetingDate = ref(true)
+const showMeetingContent = ref(true)
+const showMeetingType = ref(true)
+
+const displayWeeks = computed(() => {
+  if (weekNumberMode.value === 'yearly') {
+    return tableData.value.map(row => row.week)
+  }
+
+  const monthWeekCounter = new Map<string, number>()
+  return tableData.value.map(row => {
+    const monthKey = row.month
+    const current = monthWeekCounter.get(monthKey) ?? 0
+    const next = current + 1
+    monthWeekCounter.set(monthKey, next)
+    return next
+  })
+})
 
 const availableTypes = computed(() => {
     const types = new Set<string>()
@@ -76,10 +96,17 @@ const generateTableData = (records: MeetingRecord[]) => {
 
   departments.value = Array.from(deptSet).sort((a, b) => {
       if (deptOrderMap.value.size > 0) {
-          const orderA = deptOrderMap.value.get(a) ?? 999
-          const orderB = deptOrderMap.value.get(b) ?? 999
-          if (orderA !== orderB) {
-              return orderA - orderB
+          const orderA = deptOrderMap.value.get(a)
+          const orderB = deptOrderMap.value.get(b)
+          
+          if (orderA === undefined) console.warn(`Department not found in sort map: "${a}"`)
+          if (orderB === undefined) console.warn(`Department not found in sort map: "${b}"`)
+          
+          const valA = orderA ?? 999
+          const valB = orderB ?? 999
+          
+          if (valA !== valB) {
+              return valA - valB
           }
       }
       return a.localeCompare(b)
@@ -304,7 +331,8 @@ const handleFileUpload = async (file: any) => {
       
       const dateCell = row.getCell(1).value
       const type = row.getCell(2).text
-      const department = row.getCell(3).text
+      // Normalize: trim and remove all whitespace to ensure matching
+      const department = (row.getCell(3).text || '').replace(/\s+/g, '')
       // Photo column is 4 (D). We check if we have an image for this cell.
       const photoKey = `${rowNumber}-4`
       let photo = images[photoKey] || null
@@ -407,10 +435,24 @@ const handleFileUpload = async (file: any) => {
     if (sortSheet) {
         sortSheet.eachRow((row, rowNumber) => {
             if (rowNumber <= 1) return // Skip header
-            const order = row.getCell(1).value
-            const name = row.getCell(2).text
-            if (name && typeof order === 'number') {
-                deptOrderMap.value.set(name.trim(), order)
+            const orderVal = row.getCell(1).value
+            // Normalize name
+            const name = (row.getCell(2).text || '').replace(/\s+/g, '')
+            
+            // Handle order being string or number or object
+            let order = 999
+            if (typeof orderVal === 'number') {
+                order = orderVal
+            } else if (typeof orderVal === 'string') {
+                order = parseInt(orderVal, 10)
+            } else if (orderVal && typeof orderVal === 'object' && 'result' in orderVal) {
+                 // Formula result
+                 order = Number(orderVal.result)
+            }
+
+            if (name && !isNaN(order)) {
+                console.log(`Sort rule: ${name} -> ${order}`)
+                deptOrderMap.value.set(name, order)
             }
         })
     }
@@ -524,7 +566,9 @@ const downloadWord = async () => {
             })
         ];
 
-        for (const row of tableData.value) {
+        for (let rowIndex = 0; rowIndex < tableData.value.length; rowIndex++) {
+          const row = tableData.value[rowIndex]!
+          const displayWeek = displayWeeks.value[rowIndex] ?? row.week
             const cells = [
                 new TableCell({
                     children: [new Paragraph({ text: row.month, alignment: AlignmentType.CENTER })],
@@ -532,17 +576,20 @@ const downloadWord = async () => {
                     margins: { top: 50, bottom: 50, left: 0, right: 0 },
                 }),
                 new TableCell({
-                    children: [new Paragraph({ text: String(row.week), alignment: AlignmentType.CENTER })],
+              children: [new Paragraph({ text: String(displayWeek), alignment: AlignmentType.CENTER })],
                     verticalAlign: VerticalAlign.TOP,
                     margins: { top: 50, bottom: 50, left: 0, right: 0 },
                 }),
             ];
+
+            let hasData = false;
 
             for (const dept of departments.value) {
                 const record = row[dept] as MeetingRecord | undefined;
                 const cellChildren = [];
 
                 if (record) {
+                    hasData = true;
                     const paragraphChildren = [];
                     
                     if (record.photo) {
@@ -586,23 +633,32 @@ const downloadWord = async () => {
                         }
                     }
 
-                    // Content text (Date + Content combined)
-                    // Format: 2025-01-01 周会： 会议内容
-                    const headerText = ' ' + record.date + (record.type ? ' ' + record.type : '') + '：';
-                    
-                    paragraphChildren.push(
+                    const headerParts: string[] = []
+                    if (showMeetingDate.value) {
+                      headerParts.push(record.date)
+                    }
+                    if (showMeetingType.value && record.type) {
+                      headerParts.push(record.type)
+                    }
+
+                    if (headerParts.length > 0) {
+                      paragraphChildren.push(
                         new TextRun({
-                            text: headerText,
-                            bold: true,
-                            size: 20, // 10pt
+                          text: ` ${headerParts.join(' ')}${showMeetingContent.value ? '：' : ''}`,
+                          bold: true,
+                          size: 20,
                         })
-                    );
-                    paragraphChildren.push(
+                      )
+                    }
+
+                    if (showMeetingContent.value && record.content) {
+                      paragraphChildren.push(
                         new TextRun({
-                            text: " " + record.content, // Space + Content
-                            size: 20, // 10pt
+                          text: ` ${record.content}`,
+                          size: 20,
                         })
-                    );
+                      )
+                    }
 
                     cellChildren.push(new Paragraph({
                         children: paragraphChildren,
@@ -623,7 +679,7 @@ const downloadWord = async () => {
 
             rows.push(new TableRow({ 
                 children: cells,
-                height: { value: 2000, rule: HeightRule.ATLEAST } 
+                height: { value: hasData ? 2000 : 500, rule: HeightRule.ATLEAST } 
             }));
         }
 
@@ -679,6 +735,67 @@ const downloadWord = async () => {
         loadingInstance.close()
     }
 }
+
+const downloadExcel = async () => {
+  const exportRows: ExcelExportRow[] = []
+
+  for (let rowIndex = 0; rowIndex < tableData.value.length; rowIndex++) {
+    const row = tableData.value[rowIndex]!
+    const displayWeek = displayWeeks.value[rowIndex] ?? row.week
+    const recordsByDepartment: ExcelExportRow['recordsByDepartment'] = {}
+
+    for (const dept of departments.value) {
+      const record = row[dept] as MeetingRecord | undefined
+      if (!record) {
+        recordsByDepartment[dept] = undefined
+        continue
+      }
+
+      recordsByDepartment[dept] = {
+        date: record.date,
+        type: record.type,
+        content: record.content,
+        photo: record.photo,
+      }
+    }
+
+    exportRows.push({
+      month: row.month,
+      week: displayWeek,
+      recordsByDepartment,
+    })
+  }
+
+  const hasRecord = exportRows.some((row) =>
+    Object.values(row.recordsByDepartment).some((record) => !!record),
+  )
+
+  if (!hasRecord) {
+    ElMessage.warning('没有可导出的内容')
+    return
+  }
+
+  const loadingInstance = ElLoading.service({
+    lock: true,
+    text: '正在生成 Excel...',
+    background: 'rgba(0, 0, 0, 0.7)',
+  })
+
+  try {
+    await exportReportToExcel(exportRows, departments.value, {
+      showDate: showMeetingDate.value,
+      showType: showMeetingType.value,
+      showContent: showMeetingContent.value,
+      fileName: `会议记录报表_${dayjs().format('YYYY-MM-DD')}.xlsx`,
+    })
+    ElMessage.success('Excel 导出成功')
+  } catch (error) {
+    console.error(error)
+    ElMessage.error('Excel 导出失败: ' + (error as Error).message)
+  } finally {
+    loadingInstance.close()
+  }
+}
 </script>
 
 <template>
@@ -706,49 +823,67 @@ const downloadWord = async () => {
       </div>
 
       <div class="search-toolbar" v-if="allRecords.length > 0">
-        <div class="search-item">
-            <span class="label">时间范围：</span>
-            <el-date-picker
-                v-model="searchDateRange"
-                type="daterange"
-                range-separator="-"
-                start-placeholder="开始日期"
-                end-placeholder="结束日期"
-                value-format="YYYY-MM-DD"
-            />
-        </div>
-        <div class="search-item">
-            <span class="label">类别：</span>
-            <el-select
-                v-model="searchCategories"
-                multiple
-                placeholder="请选择类别"
-                style="width: 240px"
-            >
-                <el-option
-                    v-for="item in availableTypes"
-                    :key="item"
-                    :label="item"
-                    :value="item"
-                />
-            </el-select>
-        </div>
-        <el-button type="primary"  @click="handleSearch">查询</el-button>
-        
+        <div class="search-toolbar-row">
+          <div class="search-item">
+              <span class="label">时间范围：</span>
+              <el-date-picker
+                  v-model="searchDateRange"
+                  type="daterange"
+                  range-separator="-"
+                  start-placeholder="开始日期"
+                  end-placeholder="结束日期"
+                  value-format="YYYY-MM-DD"
+              />
+          </div>
+          <div class="search-item">
+              <span class="label">类别：</span>
+              <el-select
+                  v-model="searchCategories"
+                  multiple
+                  placeholder="请选择类别"
+                  style="width: 240px"
+              >
+                  <el-option
+                      v-for="item in availableTypes"
+                      :key="item"
+                      :label="item"
+                      :value="item"
+                  />
+              </el-select>
+          </div>
+          <el-button type="primary" @click="handleSearch">查询</el-button>
 
-        <div v-if="tableData.length" class="actions">
-          <el-button type="success" @click="downloadWord">下载 Word</el-button>
-          <el-button type="success" @click="downloadPDF">下载 PDF</el-button>
+          <el-upload
+            action="#"
+            :auto-upload="false"
+            :on-change="handleFileUpload"
+            :show-file-list="false"
+            accept=".xlsx, .xls"
+          >
+             <el-button type="warning">重新上传</el-button>
+          </el-upload>
         </div>
-        <el-upload
-          action="#"
-          :auto-upload="false"
-          :on-change="handleFileUpload"
-          :show-file-list="false"
-          accept=".xlsx, .xls"
-        >
-           <el-button type="warning">重新上传</el-button>
-        </el-upload>
+
+        <div class="search-toolbar-row toolbar-second-row">
+          <div class="search-item">
+            <span class="label">周编号方式：</span>
+            <el-radio-group v-model="weekNumberMode">
+              <el-radio-button label="yearly">整年</el-radio-button>
+              <el-radio-button label="monthly">每月</el-radio-button>
+            </el-radio-group>
+          </div>
+
+          <div class="search-item output-options">
+            <el-checkbox v-model="showMeetingDate">显示会议日期</el-checkbox>
+            <el-checkbox v-model="showMeetingContent">显示会议内容</el-checkbox>
+            <el-checkbox v-model="showMeetingType">显示会议类别</el-checkbox>
+          </div>
+          <div v-if="tableData.length" class="actions">
+            <el-button type="success" @click="downloadExcel">导出 Excel</el-button>
+            <el-button type="success" @click="downloadWord">下载 Word</el-button>
+            <el-button type="success" @click="downloadPDF">下载 PDF</el-button>
+          </div>
+        </div>
       </div>
     </div>
     
@@ -762,7 +897,11 @@ const downloadWord = async () => {
         :cell-style="{ borderColor: '#333' }"
       >
         <el-table-column prop="month" label="月份" width="100" align="center" />
-        <el-table-column prop="week" label="周" width="60" align="center" />
+        <el-table-column prop="week" label="周" width="60" align="center">
+          <template #default="{ $index }">
+            {{ displayWeeks[$index] }}
+          </template>
+        </el-table-column>
         
         <el-table-column 
           v-for="dept in departments" 
@@ -773,7 +912,7 @@ const downloadWord = async () => {
         >
           <template #default="{ row }">
             <div v-if="row[dept]" class="cell-content">
-              <div v-if="row[dept].type" class="meeting-type-tag">
+              <div v-if="showMeetingType && row[dept].type" class="meeting-type-tag">
                   {{ row[dept].type }}
               </div>
               <div v-if="row[dept].photo" class="photo">
@@ -785,8 +924,8 @@ const downloadWord = async () => {
                     preview-teleported
                 />
               </div>
-              <div class="date">{{ row[dept].date }}</div>
-              <div class="text">{{ row[dept].content }}</div>
+              <div v-if="showMeetingDate" class="date">{{ row[dept].date }}</div>
+              <div v-if="showMeetingContent" class="text">{{ row[dept].content }}</div>
             </div>
           </template>
         </el-table-column>
@@ -828,20 +967,36 @@ h1 {
 }
 
 .search-toolbar {
-    display: flex;
-    gap: 20px;
-    align-items: center;
-    padding: 10px;
-    background-color: #f5f7fa;
-    border-radius: 4px;
-    width: 100%;
-    box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 10px;
+  background-color: #f5f7fa;
+  border-radius: 4px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.search-toolbar-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: center;
+  width: 100%;
+}
+
+.toolbar-second-row {
+  padding-top: 4px;
 }
 
 .search-item {
     display: flex;
     align-items: center;
     gap: 10px;
+}
+
+.output-options {
+  gap: 16px;
 }
 
 .search-item .label {
