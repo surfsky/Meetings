@@ -72,8 +72,7 @@ const buildExportFileName = (ext: 'pdf' | 'docx' | 'xlsx') => {
   return `${dayjs().format('YYMMDD')}-会议历.${ext}`
 }
 
-const lastUpdatedDate =
-  import.meta.env.VITE_LAST_UPDATED_DATE || dayjs().format('YYYY.MM.DD')
+const lastUpdatedDate = "2026.04.07";
 
 const exportLoadingText: Record<ExportType, string> = {
   excel: '正在生成 Excel...',
