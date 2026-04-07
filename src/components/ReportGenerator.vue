@@ -1,16 +1,14 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, nextTick } from 'vue'
 import { UploadFilled } from '@element-plus/icons-vue'
 import ExcelJS from 'exceljs'
 import dayjs from 'dayjs'
 import weekOfYear from 'dayjs/plugin/weekOfYear'
 import isoWeek from 'dayjs/plugin/isoWeek'
-import html2canvas from 'html2canvas'
-import jsPDF from 'jspdf'
 import JSZip from 'jszip'
-import { Document, Packer, Paragraph, Table, TableCell, TableRow, WidthType, ImageRun, TextRun, VerticalAlign, PageOrientation, AlignmentType, LineRuleType, HeightRule, Footer, PageNumber, TextWrappingType, TextWrappingSide } from 'docx'
-import { saveAs } from 'file-saver'
 import { exportReportToExcel, type ExcelExportRow } from '../utils/reportExcelExport'
+import { exportReportToWord } from '../utils/reportWordExport'
+import { exportReportElementToPdf } from '../utils/reportPdfExport'
 
 dayjs.extend(weekOfYear)
 dayjs.extend(isoWeek)
@@ -44,6 +42,8 @@ const weekNumberMode = ref<'yearly' | 'monthly'>('yearly')
 const showMeetingDate = ref(true)
 const showMeetingContent = ref(true)
 const showMeetingType = ref(true)
+const exportingType = ref<'excel' | 'word' | 'pdf' | null>(null)
+type ExportType = 'excel' | 'word' | 'pdf'
 
 const displayWeeks = computed(() => {
   if (weekNumberMode.value === 'yearly') {
@@ -67,6 +67,67 @@ const availableTypes = computed(() => {
     })
     return Array.from(types)
 })
+
+const buildExportFileName = (ext: 'pdf' | 'docx' | 'xlsx') => {
+  return `${dayjs().format('YYMMDD')}-会议历.${ext}`
+}
+
+const lastUpdatedDate =
+  import.meta.env.VITE_LAST_UPDATED_DATE || dayjs().format('YYYY.MM.DD')
+
+const exportLoadingText: Record<ExportType, string> = {
+  excel: '正在生成 Excel...',
+  word: '正在生成 Word...',
+  pdf: '正在生成 PDF...',
+}
+
+const exportSuccessText: Record<ExportType, string> = {
+  excel: 'Excel 导出成功',
+  word: 'Word 下载成功',
+  pdf: 'PDF 下载成功',
+}
+
+const exportErrorText: Record<ExportType, string> = {
+  excel: 'Excel 导出失败: ',
+  word: 'Word 生成失败: ',
+  pdf: 'PDF 生成失败: ',
+}
+
+const currentExportLoadingText = computed(() => {
+  if (!exportingType.value) return ''
+  return exportLoadingText[exportingType.value]
+})
+
+const waitForNextPaint = async () => {
+  await nextTick()
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+  await new Promise<void>((resolve) => setTimeout(() => resolve(), 0))
+}
+
+const runExportWithLoading = async (
+  type: ExportType,
+  task: () => Promise<boolean>,
+) => {
+  if (exportingType.value) {
+    ElMessage.info('正在导出，请稍候...')
+    return
+  }
+
+  exportingType.value = type
+  await waitForNextPaint()
+
+  try {
+    const completed = await task()
+    if (completed) {
+      ElMessage.success(exportSuccessText[type])
+    }
+  } catch (error) {
+    console.error(error)
+    ElMessage.error(exportErrorText[type] + (error as Error).message)
+  } finally {
+    exportingType.value = null
+  }
+}
 
 const handleSearch = () => {
     if (allRecords.value.length === 0) return
@@ -466,277 +527,7 @@ const handleFileUpload = async (file: any) => {
   }
 }
 
-const downloadPDF = async () => {
-  const element = document.getElementById('print-area')
-  if (!element) {
-    ElMessage.warning('没有可导出的内容')
-    return
-  }
-
-  const loadingInstance = ElLoading.service({
-    lock: true,
-    text: '正在生成 PDF...',
-    background: 'rgba(0, 0, 0, 0.7)',
-  })
-
-  try {
-    const canvas = await html2canvas(element, {
-      scale: 2,
-      useCORS: true,
-      logging: false,
-      allowTaint: true
-    })
-    
-    const imgData = canvas.toDataURL('image/png')
-    const pdf = new jsPDF('l', 'mm', 'a4') // Landscape, mm, A4
-
-    const pdfWidth = 297
-    const pdfHeight = 210
-    
-    // Add margins
-    const margin = 10; // 10mm margin
-    const contentWidth = pdfWidth - (margin * 2);
-    const contentHeight = (canvas.height * contentWidth) / canvas.width;
-    
-    let heightLeft = contentHeight
-    let position = margin // Start at margin
-
-    // First page
-    pdf.addImage(imgData, 'PNG', margin, position, contentWidth, contentHeight)
-    heightLeft -= (pdfHeight - margin * 2)
-
-    // Subsequent pages
-    while (heightLeft > 0) {
-      position -= (pdfHeight - margin * 2) // Move position up by one page height content
-      pdf.addPage()
-      pdf.addImage(imgData, 'PNG', margin, position, contentWidth, contentHeight)
-      heightLeft -= (pdfHeight - margin * 2)
-    }
-    
-    pdf.save(`会议记录报表_${dayjs().format('YYYY-MM-DD')}.pdf`)
-    ElMessage.success('PDF 下载成功')
-  } catch (error) {
-    console.error(error)
-    ElMessage.error('PDF 生成失败: ' + (error as Error).message)
-  } finally {
-    loadingInstance.close()
-  }
-}
-
-const downloadWord = async () => {
-    if (!tableData.value.length) {
-        ElMessage.warning('没有可导出的内容')
-        return
-    }
-
-    const loadingInstance = ElLoading.service({
-        lock: true,
-        text: '正在生成 Word...',
-        background: 'rgba(0, 0, 0, 0.7)',
-    })
-
-    try {
-        // Prepare table headers
-        const headers = [
-            new TableCell({
-                children: [new Paragraph({ text: "月份", alignment: AlignmentType.CENTER })],
-                width: { size: 5, type: WidthType.PERCENTAGE }, // Reduced to 5%
-                verticalAlign: VerticalAlign.CENTER,
-                margins: { top: 50, bottom: 50, left: 0, right: 0 },
-            }),
-            new TableCell({
-                children: [new Paragraph({ text: "周", alignment: AlignmentType.CENTER })],
-                width: { size: 5, type: WidthType.PERCENTAGE },
-                verticalAlign: VerticalAlign.CENTER,
-                margins: { top: 50, bottom: 50, left: 0, right: 0 },
-            }),
-            ...departments.value.map(dept => new TableCell({
-                children: [new Paragraph({ text: dept, alignment: AlignmentType.CENTER })],
-                width: { size: 90 / departments.value.length, type: WidthType.PERCENTAGE }, // Adjusted remaining width
-                verticalAlign: VerticalAlign.CENTER,
-                margins: { top: 50, bottom: 50, left: 0, right: 0 },
-            }))
-        ];
-
-        // Prepare table rows
-        const rows = [
-            new TableRow({
-                children: headers,
-                tableHeader: false, // Don't repeat header on every page
-            })
-        ];
-
-        for (let rowIndex = 0; rowIndex < tableData.value.length; rowIndex++) {
-          const row = tableData.value[rowIndex]!
-          const displayWeek = displayWeeks.value[rowIndex] ?? row.week
-            const cells = [
-                new TableCell({
-                    children: [new Paragraph({ text: row.month, alignment: AlignmentType.CENTER })],
-                    verticalAlign: VerticalAlign.TOP,
-                    margins: { top: 50, bottom: 50, left: 0, right: 0 },
-                }),
-                new TableCell({
-              children: [new Paragraph({ text: String(displayWeek), alignment: AlignmentType.CENTER })],
-                    verticalAlign: VerticalAlign.TOP,
-                    margins: { top: 50, bottom: 50, left: 0, right: 0 },
-                }),
-            ];
-
-            let hasData = false;
-
-            for (const dept of departments.value) {
-                const record = row[dept] as MeetingRecord | undefined;
-                const cellChildren = [];
-
-                if (record) {
-                    hasData = true;
-                    const paragraphChildren = [];
-                    
-                    if (record.photo) {
-                        // Handle base64 image
-                        // Format: data:image/png;base64,....
-                        const base64Data = record.photo.split(',')[1];
-                        if (base64Data) {
-                            try {
-                                const buffer = Uint8Array.from(atob(base64Data), c => c.charCodeAt(0));
-                                paragraphChildren.push(
-                                    new ImageRun({
-                                        data: buffer,
-                                        transformation: {
-                                            width: 280, // Increased width
-                                            height: 200, // Increased height
-                                        },
-                                        type: 'png',
-                                        floating: {
-                                            horizontalPosition: {
-                                                align: AlignmentType.CENTER, // Center image horizontally
-                                            },
-                                            verticalPosition: {
-                                                align: VerticalAlign.TOP, // Align top
-                                            },
-                                            wrap: {
-                                                type: TextWrappingType.TOP_AND_BOTTOM, // Top and Bottom wrapping
-                                                side: TextWrappingSide.BOTH_SIDES,
-                                            },
-                                            margins: {
-                                                top: 0,
-                                                bottom: 0, // Removed space below image
-                                            }
-                                        }
-                                    })
-                                );
-                                // Add line break after image
-                                paragraphChildren.push(new TextRun({ text: "", break: 1 })); 
-                            } catch (e) {
-                                console.error('Failed to process image for word:', e);
-                            }
-                        }
-                    }
-
-                    const headerParts: string[] = []
-                    if (showMeetingDate.value) {
-                      headerParts.push(record.date)
-                    }
-                    if (showMeetingType.value && record.type) {
-                      headerParts.push(record.type)
-                    }
-
-                    if (headerParts.length > 0) {
-                      paragraphChildren.push(
-                        new TextRun({
-                          text: ` ${headerParts.join(' ')}${showMeetingContent.value ? '：' : ''}`,
-                          bold: true,
-                          size: 20,
-                        })
-                      )
-                    }
-
-                    if (showMeetingContent.value && record.content) {
-                      paragraphChildren.push(
-                        new TextRun({
-                          text: ` ${record.content}`,
-                          size: 20,
-                        })
-                      )
-                    }
-
-                    cellChildren.push(new Paragraph({
-                        children: paragraphChildren,
-                        alignment: AlignmentType.LEFT,
-                        indent: { left: 0 }, // Remove indentation
-                        spacing: { line: 240, lineRule: LineRuleType.AUTO, before: 0 }, // Remove top spacing
-                    }));
-                } else {
-                    cellChildren.push(new Paragraph({ text: "" }));
-                }
-
-                cells.push(new TableCell({
-                    children: cellChildren,
-                    verticalAlign: VerticalAlign.TOP,
-                    margins: { top: 50, bottom: 50, left: 0, right: 0 }, // Zero left margin
-                }));
-            }
-
-            rows.push(new TableRow({ 
-                children: cells,
-                height: { value: hasData ? 2000 : 500, rule: HeightRule.ATLEAST } 
-            }));
-        }
-
-        const doc = new Document({
-            sections: [{
-                properties: {
-                    page: {
-                        size: {
-                            orientation: PageOrientation.LANDSCAPE,
-                        },
-                        margin: {
-                            top: 1000,
-                            bottom: 1000,
-                            left: 1000,
-                            right: 1000,
-                        }
-                    },
-                },
-                footers: {
-                    default: new Footer({
-                        children: [
-                            new Paragraph({
-                                alignment: AlignmentType.CENTER,
-                                children: [
-                                    new TextRun({
-                                        children: [PageNumber.CURRENT],
-                                    }),
-                                ],
-                            }),
-                        ],
-                    }),
-                },
-                children: [
-                    new Table({
-                        rows: rows,
-                        width: {
-                            size: 100,
-                            type: WidthType.PERCENTAGE,
-                        },
-                    }),
-                ],
-            }],
-        });
-
-        const blob = await Packer.toBlob(doc);
-        saveAs(blob, `会议记录报表_${dayjs().format('YYYY-MM-DD')}.docx`);
-        ElMessage.success('Word 下载成功');
-
-    } catch (error) {
-        console.error(error)
-        ElMessage.error('Word 生成失败: ' + (error as Error).message)
-    } finally {
-        loadingInstance.close()
-    }
-}
-
-const downloadExcel = async () => {
+const buildExportRows = (): ExcelExportRow[] => {
   const exportRows: ExcelExportRow[] = []
 
   for (let rowIndex = 0; rowIndex < tableData.value.length; rowIndex++) {
@@ -766,40 +557,69 @@ const downloadExcel = async () => {
     })
   }
 
-  const hasRecord = exportRows.some((row) =>
-    Object.values(row.recordsByDepartment).some((record) => !!record),
-  )
+  return exportRows
+}
 
-  if (!hasRecord) {
-    ElMessage.warning('没有可导出的内容')
-    return
-  }
+const downloadPDF = async () => {
+  await runExportWithLoading('pdf', async () => {
+    const element = document.getElementById('print-area')
+    if (!element) {
+      ElMessage.warning('没有可导出的内容')
+      return false
+    }
 
-  const loadingInstance = ElLoading.service({
-    lock: true,
-    text: '正在生成 Excel...',
-    background: 'rgba(0, 0, 0, 0.7)',
+    await exportReportElementToPdf(element, buildExportFileName('pdf'))
+    return true
   })
+}
 
-  try {
+const downloadWord = async () => {
+  await runExportWithLoading('word', async () => {
+    if (!tableData.value.length) {
+      ElMessage.warning('没有可导出的内容')
+      return false
+    }
+
+    await exportReportToWord(buildExportRows(), departments.value, {
+      showDate: showMeetingDate.value,
+      showType: showMeetingType.value,
+      showContent: showMeetingContent.value,
+      fileName: buildExportFileName('docx'),
+    })
+    return true
+  })
+}
+
+const downloadExcel = async () => {
+  await runExportWithLoading('excel', async () => {
+    const exportRows = buildExportRows()
+    const hasRecord = exportRows.some((row) =>
+      Object.values(row.recordsByDepartment).some((record) => !!record),
+    )
+
+    if (!hasRecord) {
+      ElMessage.warning('没有可导出的内容')
+      return false
+    }
+
     await exportReportToExcel(exportRows, departments.value, {
       showDate: showMeetingDate.value,
       showType: showMeetingType.value,
       showContent: showMeetingContent.value,
-      fileName: `会议记录报表_${dayjs().format('YYYY-MM-DD')}.xlsx`,
+      fileName: buildExportFileName('xlsx'),
     })
-    ElMessage.success('Excel 导出成功')
-  } catch (error) {
-    console.error(error)
-    ElMessage.error('Excel 导出失败: ' + (error as Error).message)
-  } finally {
-    loadingInstance.close()
-  }
+    return true
+  })
 }
 </script>
 
 <template>
-  <div class="report-container">
+  <div
+    class="report-container"
+    v-loading.fullscreen.lock="!!exportingType"
+    :element-loading-text="currentExportLoadingText"
+    element-loading-background="rgba(0, 0, 0, 0.7)"
+  >
     <h1>会议历</h1>
     <div class="toolbar-container">
       <div class="top-toolbar" v-if="allRecords.length === 0">
@@ -879,9 +699,9 @@ const downloadExcel = async () => {
             <el-checkbox v-model="showMeetingType">显示会议类别</el-checkbox>
           </div>
           <div v-if="tableData.length" class="actions">
-            <el-button type="success" @click="downloadExcel">导出 Excel</el-button>
-            <el-button type="success" @click="downloadWord">下载 Word</el-button>
-            <el-button type="success" @click="downloadPDF">下载 PDF</el-button>
+            <el-button type="success" :loading="exportingType === 'word'" :disabled="!!exportingType && exportingType !== 'word'" @click="downloadWord">下载 Word</el-button>
+            <el-button type="success" :loading="exportingType === 'pdf'" :disabled="!!exportingType && exportingType !== 'pdf'" @click="downloadPDF">下载 PDF</el-button>
+            <el-button type="success" :loading="exportingType === 'excel'" :disabled="!!exportingType && exportingType !== 'excel'" @click="downloadExcel">导出 Excel</el-button>
           </div>
         </div>
       </div>
@@ -931,6 +751,8 @@ const downloadExcel = async () => {
         </el-table-column>
       </el-table>
     </div>
+
+    <div class="last-updated">{{ lastUpdatedDate }}</div>
   </div>
 </template>
 
@@ -1100,8 +922,23 @@ h1 {
   white-space: pre-wrap;
 }
 
+.last-updated {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 14px;
+  text-align: center;
+  color: #666;
+  font-size: 12px;
+  font-weight: 600;
+  pointer-events: none;
+}
+
 @media print {
   .toolbar {
+    display: none;
+  }
+  .last-updated {
     display: none;
   }
   .report-container {
